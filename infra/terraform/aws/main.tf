@@ -1,242 +1,565 @@
-# ===============================================
-# AI Curation Engine - AWS Terraform Configuration
-# ===============================================
+# AWS Infrastructure for Perimeter Gateway
 
 terraform {
-  required_version = ">= 1.0"
+  required_version = ">= 1.5"
+  
   required_providers {
     aws = {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
-    random = {
-      source  = "hashicorp/random"
-      version = "~> 3.1"
-    }
   }
-}
-
-# Configure AWS Provider
-provider "aws" {
-  region = var.aws_region
   
-  default_tags {
-    tags = {
-      Project     = "ai-curation-engine"
-      Environment = var.environment
-      ManagedBy   = "terraform"
-      Owner       = var.owner
-    }
+  backend "s3" {
+    bucket = "perimeter-terraform-state"
+    key    = "aws/prod/terraform.tfstate"
+    region = "us-east-1"
   }
 }
 
-# Data sources
+provider "aws" {
+  region = var.region
+}
+
+# VPC Configuration
+resource "aws_vpc" "main" {
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_hostnames = true
+  enable_dns_support   = true
+
+  tags = {
+    Name        = "perimeter-vpc"
+    Environment = var.environment
+  }
+}
+
+resource "aws_subnet" "private" {
+  count             = 2
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = "10.0.${count.index + 1}.0/24"
+  availability_zone = data.aws_availability_zones.available.names[count.index]
+
+  tags = {
+    Name = "perimeter-private-${count.index + 1}"
+  }
+}
+
+resource "aws_subnet" "public" {
+  count                   = 2
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = "10.0.${count.index + 10}.0/24"
+  availability_zone       = data.aws_availability_zones.available.names[count.index]
+  map_public_ip_on_launch = true
+
+  tags = {
+    Name = "perimeter-public-${count.index + 1}"
+  }
+}
+
 data "aws_availability_zones" "available" {
   state = "available"
 }
 
-data "aws_ami" "ubuntu" {
-  most_recent = true
-  owners      = ["099720109477"] # Canonical
-
-  filter {
-    name   = "name"
-    values = ["ubuntu/images/hvm-ssd/ubuntu-22.04-amd64-server-*"]
-  }
-
-  filter {
-    name   = "virtualization-type"
-    values = ["hvm"]
-  }
-}
-
-# Random password for database
-resource "random_password" "db_password" {
-  length  = 16
-  special = true
-}
-
-# VPC Module
-module "vpc" {
-  source = "../modules/networking"
-  
-  project_name = var.project_name
-  environment  = var.environment
-  vpc_cidr     = var.vpc_cidr
-  azs          = slice(data.aws_availability_zones.available.names, 0, 2)
-}
-
-# Security Module
-module "security" {
-  source = "../modules/security"
-  
-  project_name = var.project_name
-  environment  = var.environment
-  vpc_id       = module.vpc.vpc_id
-  vpc_cidr     = var.vpc_cidr
-}
-
-# Storage Module (for application data and models)
-module "storage" {
-  source = "../modules/storage"
-  
-  project_name = var.project_name
-  environment  = var.environment
-}
-
-# Compute Module
-module "compute" {
-  source = "../modules/compute"
-  
-  project_name           = var.project_name
-  environment           = var.environment
-  instance_type         = var.instance_type
-  ami_id                = data.aws_ami.ubuntu.id
-  key_pair_name         = var.key_pair_name
-  vpc_id                = module.vpc.vpc_id
-  public_subnet_ids     = module.vpc.public_subnet_ids
-  private_subnet_ids    = module.vpc.private_subnet_ids
-  security_group_ids    = [module.security.app_security_group_id]
-  alb_security_group_id = module.security.alb_security_group_id
-  
-  # Application configuration
-  db_endpoint  = aws_db_instance.main.endpoint
-  db_name      = aws_db_instance.main.db_name
-  db_username  = aws_db_instance.main.username
-  db_password  = random_password.db_password.result
-  
-  # S3 bucket for model storage
-  model_bucket_name = module.storage.model_bucket_name
-  
-  depends_on = [aws_db_instance.main]
-}
-
-# RDS Database for application data
-resource "aws_db_subnet_group" "main" {
-  name       = "${var.project_name}-${var.environment}-db-subnet-group"
-  subnet_ids = module.vpc.private_subnet_ids
+# Internet Gateway
+resource "aws_internet_gateway" "main" {
+  vpc_id = aws_vpc.main.id
 
   tags = {
-    Name = "${var.project_name}-${var.environment}-db-subnet-group"
+    Name = "perimeter-igw"
+  }
+}
+
+# NAT Gateway
+resource "aws_eip" "nat" {
+  count  = 2
+  domain = "vpc"
+
+  tags = {
+    Name = "perimeter-nat-eip-${count.index + 1}"
+  }
+}
+
+resource "aws_nat_gateway" "main" {
+  count         = 2
+  allocation_id = aws_eip.nat[count.index].id
+  subnet_id     = aws_subnet.public[count.index].id
+
+  tags = {
+    Name = "perimeter-nat-${count.index + 1}"
+  }
+}
+
+# Route Tables
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.main.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.main.id
+  }
+
+  tags = {
+    Name = "perimeter-public-rt"
+  }
+}
+
+resource "aws_route_table" "private" {
+  count  = 2
+  vpc_id = aws_vpc.main.id
+
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.main[count.index].id
+  }
+
+  tags = {
+    Name = "perimeter-private-rt-${count.index + 1}"
+  }
+}
+
+resource "aws_route_table_association" "public" {
+  count          = 2
+  subnet_id      = aws_subnet.public[count.index].id
+  route_table_id = aws_route_table.public.id
+}
+
+resource "aws_route_table_association" "private" {
+  count          = 2
+  subnet_id      = aws_subnet.private[count.index].id
+  route_table_id = aws_route_table.private[count.index].id
+}
+
+# Security Groups
+resource "aws_security_group" "alb" {
+  name        = "perimeter-alb-sg"
+  description = "Security group for ALB"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "perimeter-alb-sg"
+  }
+}
+
+resource "aws_security_group" "ecs_tasks" {
+  name        = "perimeter-ecs-tasks-sg"
+  description = "Security group for ECS tasks"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    from_port       = 8000
+    to_port         = 8000
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb.id]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "perimeter-ecs-tasks-sg"
+  }
+}
+
+# ElastiCache Redis
+resource "aws_elasticache_subnet_group" "main" {
+  name       = "perimeter-cache-subnet"
+  subnet_ids = aws_subnet.private[*].id
+}
+
+resource "aws_security_group" "redis" {
+  name        = "perimeter-redis-sg"
+  description = "Security group for Redis"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    from_port       = 6379
+    to_port         = 6379
+    protocol        = "tcp"
+    security_groups = [aws_security_group.ecs_tasks.id]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "perimeter-redis-sg"
+  }
+}
+
+resource "aws_elasticache_replication_group" "main" {
+  replication_group_id       = "perimeter-cache"
+  replication_group_description = "Perimeter Redis cache"
+  engine                     = "redis"
+  engine_version             = "7.0"
+  node_type                  = "cache.t3.medium"
+  number_cache_clusters      = 2
+  port                       = 6379
+  subnet_group_name          = aws_elasticache_subnet_group.main.name
+  security_group_ids         = [aws_security_group.redis.id]
+  automatic_failover_enabled = true
+  at_rest_encryption_enabled = true
+  transit_encryption_enabled = true
+
+  tags = {
+    Name = "perimeter-cache"
+  }
+}
+
+# RDS PostgreSQL
+resource "aws_db_subnet_group" "main" {
+  name       = "perimeter-db-subnet"
+  subnet_ids = aws_subnet.private[*].id
+
+  tags = {
+    Name = "perimeter-db-subnet"
+  }
+}
+
+resource "aws_security_group" "rds" {
+  name        = "perimeter-rds-sg"
+  description = "Security group for RDS"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    from_port       = 5432
+    to_port         = 5432
+    protocol        = "tcp"
+    security_groups = [aws_security_group.ecs_tasks.id]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "perimeter-rds-sg"
   }
 }
 
 resource "aws_db_instance" "main" {
-  identifier             = "${var.project_name}-${var.environment}-db"
-  allocated_storage      = var.db_allocated_storage
-  max_allocated_storage  = var.db_max_allocated_storage
-  storage_type           = "gp3"
+  identifier             = "perimeter-db"
   engine                 = "postgres"
   engine_version         = "15.4"
-  instance_class         = var.db_instance_class
-  db_name                = "curation_engine"
-  username               = "curation_admin"
-  password               = random_password.db_password.result
-  
-  vpc_security_group_ids = [module.security.db_security_group_id]
+  instance_class         = "db.t3.medium"
+  allocated_storage      = 20
+  storage_type           = "gp3"
+  storage_encrypted      = true
+  db_name                = "perimeter"
+  username               = var.db_username
+  password               = var.db_password
   db_subnet_group_name   = aws_db_subnet_group.main.name
-  
-  backup_retention_period = var.environment == "production" ? 7 : 1
-  backup_window          = "03:00-04:00"
-  maintenance_window     = "sun:04:00-sun:05:00"
-  
-  skip_final_snapshot = var.environment != "production"
-  final_snapshot_identifier = var.environment == "production" ? "${var.project_name}-${var.environment}-final-snapshot-${formatdate("YYYY-MM-DD-hhmm", timestamp())}" : null
-  
-  # Enable encryption for production
-  storage_encrypted = var.environment == "production"
-  
-  # Performance monitoring
-  monitoring_interval = var.environment == "production" ? 60 : 0
-  monitoring_role_arn = var.environment == "production" ? aws_iam_role.rds_monitoring[0].arn : null
-  
+  vpc_security_group_ids = [aws_security_group.rds.id]
+  multi_az               = true
+  backup_retention_period = 7
+  skip_final_snapshot    = false
+  final_snapshot_identifier = "perimeter-final-snapshot"
+
   tags = {
-    Name = "${var.project_name}-${var.environment}-database"
+    Name = "perimeter-db"
   }
 }
 
-# IAM role for RDS monitoring (production only)
-resource "aws_iam_role" "rds_monitoring" {
-  count = var.environment == "production" ? 1 : 0
-  name  = "${var.project_name}-${var.environment}-rds-monitoring-role"
+# ECR Repository
+resource "aws_ecr_repository" "gateway" {
+  name                 = "perimeter-gateway"
+  image_tag_mutability = "MUTABLE"
+
+  image_scanning_configuration {
+    scan_on_push = true
+  }
+
+  encryption_configuration {
+    encryption_type = "AES256"
+  }
+
+  tags = {
+    Name = "perimeter-gateway"
+  }
+}
+
+# ECS Cluster
+resource "aws_ecs_cluster" "main" {
+  name = "perimeter-cluster"
+
+  setting {
+    name  = "containerInsights"
+    value = "enabled"
+  }
+
+  tags = {
+    Name = "perimeter-cluster"
+  }
+}
+
+# ECS Task Definition
+resource "aws_ecs_task_definition" "gateway" {
+  family                   = "perimeter-gateway"
+  network_mode             = "awsvpc"
+  requires_compatibilities = ["FARGATE"]
+  cpu                      = "1024"
+  memory                   = "2048"
+  execution_role_arn       = aws_iam_role.ecs_execution.arn
+  task_role_arn            = aws_iam_role.ecs_task.arn
+
+  container_definitions = jsonencode([{
+    name  = "gateway"
+    image = "${aws_ecr_repository.gateway.repository_url}:latest"
+    
+    portMappings = [{
+      containerPort = 8000
+      protocol      = "tcp"
+    }]
+    
+    environment = [
+      {
+        name  = "ENVIRONMENT"
+        value = "production"
+      },
+      {
+        name  = "REDIS_URL"
+        value = "redis://${aws_elasticache_replication_group.main.primary_endpoint_address}:6379/0"
+      },
+      {
+        name  = "DATABASE_URL"
+        value = "postgresql+asyncpg://${var.db_username}:${var.db_password}@${aws_db_instance.main.endpoint}/perimeter"
+      }
+    ]
+    
+    logConfiguration = {
+      logDriver = "awslogs"
+      options = {
+        "awslogs-group"         = aws_cloudwatch_log_group.gateway.name
+        "awslogs-region"        = var.region
+        "awslogs-stream-prefix" = "gateway"
+      }
+    }
+    
+    healthCheck = {
+      command     = ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval    = 30
+      timeout     = 5
+      retries     = 3
+      startPeriod = 60
+    }
+  }])
+
+  tags = {
+    Name = "perimeter-gateway"
+  }
+}
+
+# CloudWatch Log Group
+resource "aws_cloudwatch_log_group" "gateway" {
+  name              = "/ecs/perimeter-gateway"
+  retention_in_days = 30
+
+  tags = {
+    Name = "perimeter-gateway-logs"
+  }
+}
+
+# Application Load Balancer
+resource "aws_lb" "main" {
+  name               = "perimeter-alb"
+  internal           = false
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.alb.id]
+  subnets            = aws_subnet.public[*].id
+
+  enable_deletion_protection = true
+  enable_http2              = true
+
+  tags = {
+    Name = "perimeter-alb"
+  }
+}
+
+resource "aws_lb_target_group" "gateway" {
+  name        = "perimeter-gateway-tg"
+  port        = 8000
+  protocol    = "HTTP"
+  vpc_id      = aws_vpc.main.id
+  target_type = "ip"
+
+  health_check {
+    enabled             = true
+    healthy_threshold   = 2
+    unhealthy_threshold = 3
+    timeout             = 5
+    interval            = 30
+    path                = "/health"
+    matcher             = "200"
+  }
+
+  tags = {
+    Name = "perimeter-gateway-tg"
+  }
+}
+
+resource "aws_lb_listener" "https" {
+  load_balancer_arn = aws_lb.main.arn
+  port              = "443"
+  protocol          = "HTTPS"
+  ssl_policy        = "ELBSecurityPolicy-TLS13-1-2-2021-06"
+  certificate_arn   = var.certificate_arn
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.gateway.arn
+  }
+}
+
+resource "aws_lb_listener" "http" {
+  load_balancer_arn = aws_lb.main.arn
+  port              = "80"
+  protocol          = "HTTP"
+
+  default_action {
+    type = "redirect"
+    redirect {
+      port        = "443"
+      protocol    = "HTTPS"
+      status_code = "HTTP_301"
+    }
+  }
+}
+
+# ECS Service
+resource "aws_ecs_service" "gateway" {
+  name            = "perimeter-gateway"
+  cluster         = aws_ecs_cluster.main.id
+  task_definition = aws_ecs_task_definition.gateway.arn
+  desired_count   = 3
+  launch_type     = "FARGATE"
+
+  network_configuration {
+    subnets          = aws_subnet.private[*].id
+    security_groups  = [aws_security_group.ecs_tasks.id]
+    assign_public_ip = false
+  }
+
+  load_balancer {
+    target_group_arn = aws_lb_target_group.gateway.arn
+    container_name   = "gateway"
+    container_port   = 8000
+  }
+
+  depends_on = [aws_lb_listener.https]
+
+  tags = {
+    Name = "perimeter-gateway"
+  }
+}
+
+# Auto Scaling
+resource "aws_appautoscaling_target" "ecs" {
+  max_capacity       = 20
+  min_capacity       = 3
+  resource_id        = "service/${aws_ecs_cluster.main.name}/${aws_ecs_service.gateway.name}"
+  scalable_dimension = "ecs:service:DesiredCount"
+  service_namespace  = "ecs"
+}
+
+resource "aws_appautoscaling_policy" "ecs_cpu" {
+  name               = "perimeter-cpu-autoscaling"
+  policy_type        = "TargetTrackingScaling"
+  resource_id        = aws_appautoscaling_target.ecs.resource_id
+  scalable_dimension = aws_appautoscaling_target.ecs.scalable_dimension
+  service_namespace  = aws_appautoscaling_target.ecs.service_namespace
+
+  target_tracking_scaling_policy_configuration {
+    target_value       = 70.0
+    predefined_metric_specification {
+      predefined_metric_type = "ECSServiceAverageCPUUtilization"
+    }
+  }
+}
+
+# IAM Roles
+resource "aws_iam_role" "ecs_execution" {
+  name = "perimeter-ecs-execution-role"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
-      {
-        Action = "sts:AssumeRole"
-        Effect = "Allow"
-        Principal = {
-          Service = "monitoring.rds.amazonaws.com"
-        }
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = {
+        Service = "ecs-tasks.amazonaws.com"
       }
-    ]
+    }]
   })
 }
 
-resource "aws_iam_role_policy_attachment" "rds_monitoring" {
-  count      = var.environment == "production" ? 1 : 0
-  role       = aws_iam_role.rds_monitoring[0].name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole"
+resource "aws_iam_role_policy_attachment" "ecs_execution" {
+  role       = aws_iam_role.ecs_execution.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
-# CloudWatch Log Group for application logs
-resource "aws_cloudwatch_log_group" "app_logs" {
-  name              = "/aws/ec2/${var.project_name}-${var.environment}"
-  retention_in_days = var.environment == "production" ? 30 : 7
+resource "aws_iam_role" "ecs_task" {
+  name = "perimeter-ecs-task-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = {
+        Service = "ecs-tasks.amazonaws.com"
+      }
+    }]
+  })
 }
 
-# Route53 DNS (if domain is provided)
-resource "aws_route53_zone" "main" {
-  count = var.domain_name != "" ? 1 : 0
-  name  = var.domain_name
+# Outputs
+output "alb_dns_name" {
+  description = "DNS name of the load balancer"
+  value       = aws_lb.main.dns_name
 }
 
-resource "aws_route53_record" "app" {
-  count   = var.domain_name != "" ? 1 : 0
-  zone_id = aws_route53_zone.main[0].zone_id
-  name    = var.environment == "production" ? var.domain_name : "${var.environment}.${var.domain_name}"
-  type    = "A"
-
-  alias {
-    name                   = module.compute.alb_dns_name
-    zone_id                = module.compute.alb_zone_id
-    evaluate_target_health = true
-  }
+output "ecr_repository_url" {
+  description = "URL of the ECR repository"
+  value       = aws_ecr_repository.gateway.repository_url
 }
 
-# SSL Certificate (if domain is provided)
-resource "aws_acm_certificate" "main" {
-  count             = var.domain_name != "" ? 1 : 0
-  domain_name       = var.environment == "production" ? var.domain_name : "${var.environment}.${var.domain_name}"
-  validation_method = "DNS"
-
-  lifecycle {
-    create_before_destroy = true
-  }
+output "redis_endpoint" {
+  description = "Redis primary endpoint"
+  value       = aws_elasticache_replication_group.main.primary_endpoint_address
 }
 
-resource "aws_route53_record" "cert_validation" {
-  count = var.domain_name != "" ? 1 : 0
-  
-  for_each = {
-    for dvo in aws_acm_certificate.main[0].domain_validation_options : dvo.domain_name => {
-      name   = dvo.resource_record_name
-      record = dvo.resource_record_value
-      type   = dvo.resource_record_type
-    }
-  }
-
-  allow_overwrite = true
-  name            = each.value.name
-  records         = [each.value.record]
-  ttl             = 60
-  type            = each.value.type
-  zone_id         = aws_route53_zone.main[0].zone_id
-}
-
-resource "aws_acm_certificate_validation" "main" {
-  count                   = var.domain_name != "" ? 1 : 0
-  certificate_arn         = aws_acm_certificate.main[0].arn
-  validation_record_fqdns = [for record in aws_route53_record.cert_validation[0] : record.fqdn]
+output "rds_endpoint" {
+  description = "RDS endpoint"
+  value       = aws_db_instance.main.endpoint
 }

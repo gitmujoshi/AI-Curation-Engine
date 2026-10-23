@@ -1,0 +1,57 @@
+version: '3.8'
+
+services:
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://backend:8001
+      - NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=${CLERK_PUBLISHABLE_KEY}
+    depends_on:
+      - backend
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+      - /app/.next
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8001:8001"
+    environment:
+      - SAAS_DATABASE_URL=postgresql://perimeter:perimeter@postgres:5432/perimeter_saas
+      - REDIS_URL=redis://redis:6379/1
+      - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY}
+      - CLERK_SECRET_KEY=${CLERK_SECRET_KEY}
+    depends_on:
+      - postgres
+      - redis
+    volumes:
+      - ./backend:/app
+
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_USER=perimeter
+      - POSTGRES_PASSWORD=perimeter
+      - POSTGRES_DB=perimeter_saas
+    ports:
+      - "5433:5432"
+    volumes:
+      - saas_postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"
+    volumes:
+      - saas_redis_data:/data
+
+volumes:
+  saas_postgres_data:
+  saas_redis_data:
