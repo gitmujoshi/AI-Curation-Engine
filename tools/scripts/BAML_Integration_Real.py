@@ -53,18 +53,33 @@ try:
     import baml_py
     BAML_AVAILABLE = True
     logger.info("✅ Real BAML client imported successfully")
-except ImportError as e:
+except (ImportError, Exception) as e:
     logger.error(f"❌ Failed to import BAML client: {e}")
     BAML_AVAILABLE = False
     # Create mock types for fallback
     class MockEnum:
         def __init__(self, value):
             self.value = value
+        UNDER_13 = "UNDER_13"
+        UNDER_16 = "UNDER_16"
+        UNDER_18 = "UNDER_18"
+        ADULT = "ADULT"
+        US = "US"
+        MODERATE = "MODERATE"
+        MEDIUM = "MEDIUM"
     
     AgeCategory = MockEnum
     Jurisdiction = MockEnum
     ParentalControls = MockEnum
     SensitivityLevel = MockEnum
+    
+    # Mock UserContext
+    class UserContext:
+        def __init__(self, age_category, jurisdiction, parental_controls, sensitivity_level):
+            self.age_category = age_category
+            self.jurisdiction = jurisdiction
+            self.parental_controls = parental_controls
+            self.sensitivity_level = sensitivity_level
 
 
 class RealBAMLContentAnalyzer:

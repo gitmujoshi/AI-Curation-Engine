@@ -38,6 +38,17 @@ except ImportError:
     BAML_AVAILABLE = False
     print("⚠️  BAML not available. Install dependencies and generate client.")
 
+# Import pluggable curation engine for multi-layer strategy
+sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent / "tools" / "scripts"))
+try:
+    from curation_engine_pluggable import CurationEngine, CurationStrategy, UserContext as PluggableUserContext
+    from BAML_Integration_Real import UserContext as RealUserContext, AgeCategory, Jurisdiction, ParentalControls, SensitivityLevel
+    MULTI_LAYER_AVAILABLE = True
+    print("✅ Multi-layer curation engine loaded")
+except ImportError as e:
+    MULTI_LAYER_AVAILABLE = False
+    print(f"⚠️  Multi-layer engine not available: {e}")
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -52,6 +63,8 @@ CORS(app)
 # Global variables
 analyzer = None
 pipeline = None
+curation_engine = None  # Multi-layer curation engine
+current_strategy = "multi_layer"  # Default to multi-layer for performance
 
 # Sample test content for demonstration
 SAMPLE_CONTENT = {
@@ -139,9 +152,19 @@ class TestApp:
         }
     
     async def initialize_baml(self):
-        """Initialize BAML components."""
-        global analyzer, pipeline
+        """Initialize BAML components and multi-layer engine."""
+        global analyzer, pipeline, curation_engine, current_strategy
         
+        # Initialize multi-layer engine first (preferred approach)
+        if MULTI_LAYER_AVAILABLE:
+            try:
+                curation_engine = CurationEngine(strategy=CurationStrategy.MULTI_LAYER)
+                logger.info("✅ Multi-layer curation engine initialized")
+                return True
+            except Exception as e:
+                logger.error(f"❌ Failed to initialize multi-layer engine: {e}")
+        
+        # Fallback to legacy BAML pipeline
         if not BAML_AVAILABLE:
             logger.warning("BAML not available. Some features will be disabled.")
             return False
@@ -149,22 +172,92 @@ class TestApp:
         try:
             analyzer = BAMLContentAnalyzer()
             pipeline = ContentCurationPipeline()
-            logger.info("✅ BAML components initialized successfully")
+            logger.info("✅ BAML components initialized successfully (legacy mode)")
             return True
         except Exception as e:
             logger.error(f"❌ Failed to initialize BAML: {e}")
             return False
     
     async def test_content(self, content: str, user_context: Dict[str, Any]) -> Dict[str, Any]:
-        """Test content classification."""
+        """Test content classification using multi-layer engine."""
         start_time = datetime.now()
         
         try:
-            if pipeline is None:
-                # Fallback mock classification for testing
-                result = self._mock_classification(content, user_context)
-            else:
-                # Real BAML classification
+            # Use multi-layer engine if available (preferred)
+            if curation_engine is not None and MULTI_LAYER_AVAILABLE:
+                # Create user context for multi-layer engine
+                age_val = user_context.get("age_category", "adult")
+                if age_val == "child":
+                    age = 10
+                elif age_val == "teen":
+                    age = 15
+                else:
+                    age = 25
+                
+                # Map to age category enum
+                if age < 13:
+                    age_category = AgeCategory.UNDER_13
+                elif age < 16:
+                    age_category = AgeCategory.UNDER_16
+                elif age < 18:
+                    age_category = AgeCategory.UNDER_18
+                else:
+                    age_category = AgeCategory.ADULT
+                
+                jurisdiction_str = user_context.get("jurisdiction", "US")
+                jurisdiction = getattr(Jurisdiction, jurisdiction_str.upper(), Jurisdiction.US)
+                
+                user_ctx = RealUserContext(
+                    age_category=age_category,
+                    jurisdiction=jurisdiction,
+                    parental_controls=ParentalControls.MODERATE,
+                    sensitivity_level=SensitivityLevel.MEDIUM
+                )
+                
+                # Use multi-layer curation engine
+                curation_result = await curation_engine.curate_content(content, user_ctx)
+                
+                # Convert to expected format
+                result = {
+                    "content_id": f"test_{hash(content) % 10000}",
+                    "timestamp": datetime.now().isoformat(),
+                    "processing_time_seconds": curation_result.processing_time_ms / 1000.0,
+                    "user_context": user_context,
+                    "classification": {
+                        "safety": {
+                            "score": curation_result.safety_score,
+                            "age_appropriate": "all" if curation_result.safety_score > 0.8 else "13+" if curation_result.safety_score > 0.6 else "18+",
+                            "warnings": [],
+                            "reasoning": curation_result.reason
+                        },
+                        "educational": {
+                            "score": 0.7,  # Default value
+                            "learning_objectives": [],
+                            "subject_areas": [],
+                            "cognitive_level": "understand"
+                        },
+                        "viewpoint": {
+                            "political_leaning": "neutral",
+                            "bias_score": 0.2,
+                            "credibility": curation_result.confidence,
+                            "balanced_sources": []
+                        }
+                    },
+                    "recommendation": {
+                        "action": curation_result.action,
+                        "confidence": curation_result.confidence,
+                        "reasoning": curation_result.reason
+                    },
+                    "metadata": {
+                        "content_length": len(content),
+                        "strategy_used": curation_result.strategy_used,
+                        "multi_layer_enabled": True,
+                        "cache_hit": curation_result.metadata.get("cache_hit", False) if curation_result.metadata else False,
+                        "model_providers": ["multi-layer-engine"]
+                    }
+                }
+            elif pipeline is not None:
+                # Fallback to legacy BAML pipeline
                 user_ctx = UserContext(
                     age_category=user_context.get("age_category", "adult"),
                     jurisdiction=user_context.get("jurisdiction", "US"),
@@ -173,6 +266,9 @@ class TestApp:
                     sensitivity_level=user_context.get("sensitivity_level", "medium")
                 )
                 result = await pipeline.curate_content(content, user_ctx)
+            else:
+                # Fallback mock classification for testing
+                result = self._mock_classification(content, user_context)
             
             # Calculate processing time
             processing_time = (datetime.now() - start_time).total_seconds()
@@ -336,10 +432,59 @@ def health_check():
     return jsonify({
         "status": "healthy",
         "baml_available": BAML_AVAILABLE,
+        "multi_layer_available": MULTI_LAYER_AVAILABLE,
+        "multi_layer_enabled": curation_engine is not None,
+        "current_strategy": current_strategy,
         "analyzer_ready": analyzer is not None,
         "pipeline_ready": pipeline is not None,
+        "curation_engine_ready": curation_engine is not None,
         "timestamp": datetime.now().isoformat()
     })
+
+@app.route('/api/strategy', methods=['GET', 'POST'])
+def manage_strategy():
+    """Get or set the current curation strategy."""
+    global curation_engine, current_strategy
+    
+    if request.method == 'POST':
+        data = request.json
+        new_strategy = data.get('strategy', 'multi_layer')
+        
+        if not MULTI_LAYER_AVAILABLE:
+            return jsonify({"error": "Multi-layer engine not available"}), 400
+        
+        try:
+            if new_strategy == 'llm_only':
+                curation_engine.switch_strategy(CurationStrategy.LLM_ONLY)
+            elif new_strategy == 'multi_layer':
+                curation_engine.switch_strategy(CurationStrategy.MULTI_LAYER)
+            elif new_strategy == 'hybrid':
+                curation_engine.switch_strategy(CurationStrategy.HYBRID)
+            else:
+                return jsonify({"error": f"Unknown strategy: {new_strategy}"}), 400
+            
+            current_strategy = new_strategy
+            return jsonify({
+                "status": "success",
+                "current_strategy": current_strategy,
+                "strategy_info": curation_engine.get_strategy_info()
+            })
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    
+    # GET request - return current strategy
+    if curation_engine:
+        return jsonify({
+            "current_strategy": current_strategy,
+            "strategy_info": curation_engine.get_strategy_info(),
+            "available_strategies": ["llm_only", "multi_layer", "hybrid"]
+        })
+    else:
+        return jsonify({
+            "current_strategy": "none",
+            "available_strategies": [],
+            "error": "Curation engine not initialized"
+        })
 
 @app.route('/static/<path:filename>')
 def static_files(filename):
