@@ -31,14 +31,26 @@ from dataclasses import dataclass
 from enum import Enum
 import logging
 
+logger = logging.getLogger(__name__)
+
 # Import existing BAML integration
 try:
     from BAML_Integration_Real import RealBAMLContentAnalyzer, UserContext
     BAML_AVAILABLE = True
-except ImportError:
+except (ImportError, NameError, Exception) as e:
+    logger.warning(f"BAML not available: {e}")
     BAML_AVAILABLE = False
-
-logger = logging.getLogger(__name__)
+    # Create mock UserContext
+    class UserContext:
+        def __init__(self, age_category, jurisdiction=None, parental_controls=None, sensitivity_level=None):
+            self.age_category = age_category
+            self.jurisdiction = jurisdiction
+            self.parental_controls = parental_controls
+            self.sensitivity_level = sensitivity_level
+    # Mock RealBAMLContentAnalyzer for fallback
+    class RealBAMLContentAnalyzer:
+        def __init__(self):
+            pass
 
 class CurationStrategy(Enum):
     """Available curation strategies"""
@@ -243,48 +255,84 @@ class SpecializedAILayer:
 class MultiLayerStrategy(CurationStrategyBase):
     """Production multi-layer strategy with performance optimization"""
     
-    def __init__(self):
+    def __init__(self, cache_ttl: int = 3600):
         self.fast_filter = FastFilterLayer()
         self.specialized_ai = SpecializedAILayer()
         self.llm_strategy = LLMOnlyStrategy() if BAML_AVAILABLE else None
-        self.cache = {}  # Simple in-memory cache
-        logger.info("🏭 Multi-Layer Strategy initialized")
+        self.cache = {}  # Enhanced in-memory cache with timestamps
+        self.cache_ttl = cache_ttl  # Cache time-to-live in seconds
+        logger.info("🏭 Multi-Layer Strategy initialized with caching (TTL: {}s)".format(cache_ttl))
     
     async def analyze_content(self, content: str, user_context: UserContext) -> CurationResult:
         start_time = time.time()
         
-        # Check cache first
+        # Check cache first with TTL validation
         cache_key = hashlib.md5(f"{content}{user_context.age_category}".encode()).hexdigest()
         if cache_key in self.cache:
-            cached_result = self.cache[cache_key]
-            cached_result.processing_time_ms = 1  # Cache hit is very fast
-            cached_result.metadata = cached_result.metadata or {}
-            cached_result.metadata["cache_hit"] = True
-            logger.info("⚡ Multi-layer: Cache hit")
-            return cached_result
+            cached_entry = self.cache[cache_key]
+            cache_age = time.time() - cached_entry['timestamp']
+            
+            # Return cached result if still valid
+            if cache_age < self.cache_ttl:
+                cached_result = cached_entry['result']
+                # Create a new result object to avoid modifying the cached one
+                result = CurationResult(
+                    action=cached_result.action,
+                    reason=cached_result.reason,
+                    confidence=cached_result.confidence,
+                    safety_score=cached_result.safety_score,
+                    processing_time_ms=1,  # Cache hit is very fast
+                    strategy_used=cached_result.strategy_used,
+                    metadata={
+                        **(cached_result.metadata or {}),
+                        "cache_hit": True,
+                        "cache_age_seconds": int(cache_age)
+                    }
+                )
+                logger.info(f"⚡ Multi-layer: Cache hit (age: {int(cache_age)}s)")
+                return result
+            else:
+                # Cache expired, remove it
+                del self.cache[cache_key]
+                logger.info(f"🕐 Multi-layer: Cache expired for key (age: {int(cache_age)}s)")
         
         # Layer 1: Fast filters (should be <5ms)
         fast_result = self.fast_filter.check(content)
         if fast_result:
             logger.info(f"🚫 Multi-layer: Blocked by fast filter - {fast_result.reason}")
-            self.cache[cache_key] = fast_result
+            self._cache_result(cache_key, fast_result)
             return fast_result
         
         # Layer 2: Specialized AI (should be <1s)
         specialized_result = await self.specialized_ai.analyze(content)
         if specialized_result:
             logger.info(f"🚫 Multi-layer: Blocked by specialized AI - {specialized_result.reason}")
-            self.cache[cache_key] = specialized_result
+            self._cache_result(cache_key, specialized_result)
             return specialized_result
         
         # Layer 3: LLM for complex cases (only if needed)
         if self._requires_llm_analysis(content, user_context):
             if self.llm_strategy:
                 logger.info("🧠 Multi-layer: Using LLM for complex analysis")
-                llm_result = await self.llm_strategy.analyze_content(content, user_context)
-                llm_result.strategy_used = "multi_layer_llm"
-                self.cache[cache_key] = llm_result
-                return llm_result
+                try:
+                    llm_result = await self.llm_strategy.analyze_content(content, user_context)
+                    llm_result.strategy_used = "multi_layer_llm"
+                    self._cache_result(cache_key, llm_result)
+                    return llm_result
+                except Exception as e:
+                    # LLM failed - fallback to cautious recommendation
+                    logger.error(f"❌ Multi-layer: LLM analysis failed - {e}")
+                    result = CurationResult(
+                        action="caution",
+                        reason=f"LLM analysis encountered an error: {str(e)[:100]}",
+                        confidence=0.5,
+                        safety_score=0.6,
+                        processing_time_ms=int((time.time() - start_time) * 1000),
+                        strategy_used="multi_layer_llm_fallback",
+                        metadata={"error": str(e), "fallback": True}
+                    )
+                    self._cache_result(cache_key, result)
+                    return result
             else:
                 # LLM needed but not available - use caution
                 logger.warning("⚠️ Multi-layer: LLM analysis needed but BAML not available")
@@ -293,11 +341,11 @@ class MultiLayerStrategy(CurationStrategyBase):
                     reason="Complex content requires LLM analysis but BAML is not available",
                     confidence=0.5,
                     safety_score=0.6,
-                    processing_time_ms=(time.time() - start_time) * 1000,
+                    processing_time_ms=int((time.time() - start_time) * 1000),
                     strategy_used="multi_layer_cautious",
                     metadata={"baml_required": True, "baml_available": False, "engine_strategy": "multi_layer"}
                 )
-                self.cache[cache_key] = result
+                self._cache_result(cache_key, result)
                 return result
         
         # Default: Allow content that passed all checks
@@ -311,9 +359,32 @@ class MultiLayerStrategy(CurationStrategyBase):
             metadata={"layers_passed": ["fast_filter", "specialized_ai"]}
         )
         
-        self.cache[cache_key] = result
+        self._cache_result(cache_key, result)
         logger.info("✅ Multi-layer: Content allowed")
         return result
+    
+    def _cache_result(self, cache_key: str, result: CurationResult):
+        """Store result in cache with timestamp for TTL management"""
+        self.cache[cache_key] = {
+            'result': result,
+            'timestamp': time.time()
+        }
+        
+        # Periodically clean expired entries (every 100 additions)
+        if len(self.cache) % 100 == 0:
+            self._clean_expired_cache()
+    
+    def _clean_expired_cache(self):
+        """Remove expired entries from cache"""
+        current_time = time.time()
+        expired_keys = [
+            key for key, entry in self.cache.items()
+            if current_time - entry['timestamp'] > self.cache_ttl
+        ]
+        for key in expired_keys:
+            del self.cache[key]
+        if expired_keys:
+            logger.info(f"🧹 Multi-layer: Cleaned {len(expired_keys)} expired cache entries")
     
     def _requires_llm_analysis(self, content: str, user_context: UserContext) -> bool:
         """Determine if content needs complex LLM reasoning"""
