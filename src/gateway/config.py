@@ -29,6 +29,11 @@ class Settings(BaseSettings):
     ALLOWED_ORIGINS: List[str] = ["*"]
     API_KEY_HEADER: str = "X-Perimeter-API-Key"
     
+    # JWT Authentication
+    JWT_SECRET: str = "change-me-in-production-use-openssl-rand-hex-32"
+    JWT_ALGORITHM: str = "HS256"
+    JWT_EXPIRATION_HOURS: int = 24
+    
     # Redis Cache
     REDIS_URL: str = "redis://localhost:6379/0"
     REDIS_MAX_CONNECTIONS: int = 50
